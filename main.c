@@ -51,6 +51,11 @@ struct client {
 	int tx_buf_size;
 
 	bool quit_received;
+
+	/* The mail reception state machine.  We fill out from_address
+	   when we get the MAIL FROM command, then the rcpt_address
+	   fields as we get the RCPT TO commands. */
+	char *from_address;
 };
 
 struct clientpool {
@@ -68,7 +73,7 @@ struct command_handler {
 	bool (*f)(struct client *c, char *parameters);
 };
 
-#define COMMANDS(x) x(HELO) x(QUIT)
+#define COMMANDS(x) x(HELO) x(QUIT) x(EHLO) x(MAIL)
 
 #define _mk_proto(x) \
 static bool handle_ ## x (struct client *c, char *parameters);
@@ -262,24 +267,42 @@ queue_raw_string(struct client *c, char *msg)
 		  POLLOUT);
 }
 
+static void
+_vqueue_response(bool continued,
+		 int code, struct client *c,
+		 const char *fmt, va_list args)
+{
+	char *msg;
+	char *msg2;
+	vasprintf(&msg, fmt, args);
+	asprintf(&msg2, "%03d%c%s\r\n", code, continued ? '-' : ' ', msg);
+	free(msg);
+	queue_raw_string(c, msg2);
+	free(msg2);
+}
+
 static void queue_response(int code, struct client *c,
 			   const char *fmt, ...)
 	__attribute__((format(printf, 3, 4)));
-
 static void
 queue_response(int code, struct client *c, const char *fmt, ...)
 {
 	va_list args;
-	char *msg;
-	char *msg2;
-
 	va_start(args, fmt);
-	vasprintf(&msg, fmt, args);
+	_vqueue_response(false, code, c, fmt, args);
 	va_end(args);
-	asprintf(&msg2, "%03d %s\r\n", code, msg);
-	free(msg);
-	queue_raw_string(c, msg2);
-	free(msg2);
+}
+
+static void queue_response_continued(int code, struct client *c,
+				     const char *fmt, ...)
+	__attribute__((format(printf, 3, 4)));
+static void
+queue_response_continued(int code, struct client *c, const char *fmt, ...)
+{
+	va_list args;
+	va_start(args, fmt);
+	_vqueue_response(true, code, c, fmt, args);
+	va_end(args);
 }
 
 static void
@@ -336,6 +359,51 @@ handle_QUIT(struct client *c, char *parameters)
 	return true;
 }
 
+static bool
+handle_EHLO(struct client *c, char *parameters)
+{
+	printf("EHLO from %s.\n", parameters);
+	queue_response(250, c, "Hello %.128s", parameters);
+	return true;
+}
+
+static bool
+handle_MAIL(struct client *c, char *parameters)
+{
+	char *addr_start, *addr_end;
+
+	printf("MAIL %s\n", parameters);
+	if (c->from_address) {
+		queue_response(503, c, "Already have a from address");
+		return true;
+	}
+	if (strncasecmp(parameters, "from:", 5)) {
+		queue_response(501, c, "expected from:, got %.128s",
+			       parameters);
+		return true;
+	}
+	addr_start = parameters + 5;
+	while (isspace(addr_start[0]))
+		addr_start++;
+	if (addr_start[0] != '<') {
+	bad_addr:
+		queue_response(501, c, "from: address in MAIL command must be enclosed in <>");
+		return true;
+	}
+	addr_end = addr_start + strlen(addr_start) - 1;
+	while (addr_end > addr_start && *addr_end != '>')
+		addr_end--;
+	if (addr_end == addr_start)
+		goto bad_addr;
+
+	c->from_address = malloc(addr_end - addr_start);
+	memcpy(c->from_address, addr_start + 1, addr_end - addr_start - 2);
+	c->from_address[addr_end - addr_start - 1] = 0;
+	printf("Have a from address %s.\n", c->from_address);
+	queue_response(250, c, "OK");
+	return true;
+}
+
 static void
 client_error(struct client *c)
 {
@@ -351,6 +419,7 @@ client_error(struct client *c)
 	unsubscribe(c->clientpool->w, c->fd, POLLIN|POLLOUT);
 	free(c->rx_buf);
 	free(c->tx_buf);
+	free(c->from_address);
 	free(c);
 }
 
@@ -362,6 +431,7 @@ process_command(struct client *c,
 	union smtp_verb verb;
 	char *parameters;
 
+	printf("Received command %s\n", command);
 	/* Validate and receive verb */
 	for (i = 0; i < 4; i++) {
 		if (!isprint(command[i])) { /* Covers the NUL byte case */
@@ -370,10 +440,9 @@ process_command(struct client *c,
 		}
 		verb.name[i] = toupper(command[i]);
 	}
-	if (command[4] == 0)
-		parameters = command + 4;
-	else
-		parameters = command + 5;
+	parameters = command + 4;
+	while (isspace(parameters[0]))
+		parameters++;
 	for (i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
 		if (verb.key == commands[i].k.key)
 			return commands[i].f(c, parameters);
