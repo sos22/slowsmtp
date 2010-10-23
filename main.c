@@ -24,6 +24,8 @@
 /* TX buffer size is always a multiple of this.  Must be a power of
    two. */
 #define TX_BUF_INCREMENT 1024
+/* Maximum number of recipients per message */
+#define MAX_RECIPIENTS_PER_MESSAGE 512
 
 struct listen_socket {
 	int fd;
@@ -56,6 +58,9 @@ struct client {
 	   when we get the MAIL FROM command, then the rcpt_address
 	   fields as we get the RCPT TO commands. */
 	char *from_address;
+	int nr_recips_allocated;
+	int nr_recipients;
+	char **recipients;
 };
 
 struct clientpool {
@@ -73,7 +78,7 @@ struct command_handler {
 	bool (*f)(struct client *c, char *parameters);
 };
 
-#define COMMANDS(x) x(HELO) x(QUIT) x(EHLO) x(MAIL)
+#define COMMANDS(x) x(HELO) x(QUIT) x(EHLO) x(MAIL) x(RCPT)
 
 #define _mk_proto(x) \
 static bool handle_ ## x (struct client *c, char *parameters);
@@ -367,12 +372,31 @@ handle_EHLO(struct client *c, char *parameters)
 	return true;
 }
 
+static char *
+skip_whitespace(const char *x)
+{
+	while (isspace(x[0]))
+		x++;
+	return (char *)x;
+}
+
+static char *
+parse_bracketed_address(const char *input)
+{
+	int len = strlen(input);
+	char *b;
+
+	if (len == 0 || input[0] != '<' || input[len-1] != '>')
+		return NULL;
+	b = malloc(len - 1);
+	memcpy(b, input + 1, len - 2);
+	b[len-2] = 0;
+	return b;
+}
+
 static bool
 handle_MAIL(struct client *c, char *parameters)
 {
-	char *addr_start, *addr_end;
-
-	printf("MAIL %s\n", parameters);
 	if (c->from_address) {
 		queue_response(503, c, "Already have a from address");
 		return true;
@@ -382,31 +406,58 @@ handle_MAIL(struct client *c, char *parameters)
 			       parameters);
 		return true;
 	}
-	addr_start = parameters + 5;
-	while (isspace(addr_start[0]))
-		addr_start++;
-	if (addr_start[0] != '<') {
-	bad_addr:
+	c->from_address = parse_bracketed_address(skip_whitespace(parameters+5));
+	if (!c->from_address) {
 		queue_response(501, c, "from: address in MAIL command must be enclosed in <>");
+	} else {
+		printf("Have a from address %s.\n", c->from_address);
+		queue_response(250, c, "OK");
+	}
+	return true;
+}
+
+static bool
+handle_RCPT(struct client *c, char *parameters)
+{
+	char *addr;
+
+	if (!c->from_address) {
+		queue_response(503, c, "Need MAIL FROM first");
 		return true;
 	}
-	addr_end = addr_start + strlen(addr_start) - 1;
-	while (addr_end > addr_start && *addr_end != '>')
-		addr_end--;
-	if (addr_end == addr_start)
-		goto bad_addr;
+	if (c->nr_recipients == MAX_RECIPIENTS_PER_MESSAGE) {
+		queue_response(552, c, "too many recipients");
+		return true;
+	}
+	if (strncasecmp(parameters, "to:", 3)) {
+		queue_response(501, c, "expected to:, got %.128s",
+			       parameters);
+		return true;
+	}
+	addr = parse_bracketed_address(skip_whitespace(parameters+3));
+	if (!addr) {
+		queue_response(501, c, "failed to parse %.128s",
+			       parameters);
+		return true;
+	}
 
-	c->from_address = malloc(addr_end - addr_start);
-	memcpy(c->from_address, addr_start + 1, addr_end - addr_start - 2);
-	c->from_address[addr_end - addr_start - 1] = 0;
-	printf("Have a from address %s.\n", c->from_address);
-	queue_response(250, c, "OK");
+	if (c->nr_recipients == c->nr_recips_allocated) {
+		c->nr_recips_allocated += 4;
+		c->recipients = realloc(c->recipients,
+					sizeof(c->recipients[0]) *
+					c->nr_recips_allocated);
+	}
+	c->recipients[c->nr_recipients] = addr;
+	c->nr_recipients++;
+	queue_response(250, c, "receipt to %.128s", addr);
 	return true;
 }
 
 static void
 client_error(struct client *c)
 {
+	int x;
+
 	/* The client has experience an error and needs to go away
 	 * now. */
 	close(c->fd);
@@ -420,6 +471,9 @@ client_error(struct client *c)
 	free(c->rx_buf);
 	free(c->tx_buf);
 	free(c->from_address);
+	for (x = 0; x < c->nr_recipients; x++)
+		free(c->recipients[x]);
+	free(c->recipients);
 	free(c);
 }
 
