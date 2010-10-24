@@ -713,15 +713,13 @@ static int
 _recursive_remove_ftw(const char *fpath, const struct stat *st,
 		      int typeflag, struct FTW *ftw)
 {
-	printf("Kill %s\n", fpath);
-
-	/* Call me chicken... */
-#if 0
-	if (typeflag == FTW_F)
-		unlink(fpath);
-	else if (typeflag == FTW_D)
-		rmdir(fpath);
-#endif
+	if (typeflag == FTW_F || typeflag == FTW_SL) {
+		if (unlink(fpath) < 0)
+			err(1, "unlink(%s)", fpath);
+	} else if (typeflag == FTW_DP) {
+		if (rmdir(fpath) < 0)
+			err(1, "rmdir(%s)", fpath);
+	}
 
 	return 0;
 }
@@ -731,7 +729,6 @@ recursive_remove(const char *base)
 {
 	nftw(base, _recursive_remove_ftw, 50, FTW_DEPTH|FTW_PHYS);
 }
-
 
 static void
 finished_message(struct client *c)

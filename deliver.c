@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <err.h>
 #include <errno.h>
+#include <ftw.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -183,6 +184,27 @@ pump_data(const char *name, BIO *b)
 	free(path);
 }
 
+static int
+_recursive_remove_ftw(const char *fpath, const struct stat *st,
+		      int typeflag, struct FTW *ftw)
+{
+	if (typeflag == FTW_F || typeflag == FTW_SL) {
+		if (unlink(fpath) < 0)
+			err(1, "unlink(%s)", fpath);
+	} else if (typeflag == FTW_DP) {
+		if (rmdir(fpath) < 0)
+			err(1, "rmdir(%s)", fpath);
+	}
+
+	return 0;
+}
+
+static void
+recursive_remove(const char *base)
+{
+	nftw(base, _recursive_remove_ftw, 50, FTW_DEPTH|FTW_PHYS);
+}
+
 /* This is *very* specific to Hermes.  Oh well. */
 static void
 send_message(const char *name, const char *from, const struct string_set *to,
@@ -190,6 +212,7 @@ send_message(const char *name, const char *from, const struct string_set *to,
 {
 	int code;
 	int i;
+	char *path;
 
 	code = get_server_response(bio, NULL);
 	if (code != 220)
@@ -239,6 +262,9 @@ send_message(const char *name, const char *from, const struct string_set *to,
 
 	/* Okay, it should now be away.  Go and remove the file from
 	 * the spool. */
+	asprintf(&path, "%s/spool/%s", SPOOL_DIR, name);
+	recursive_remove(path);
+	free(path);
 }
 
 static void
