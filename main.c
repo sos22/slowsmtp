@@ -94,7 +94,8 @@ struct command_handler {
 	x(EHLO)	    \
 	x(MAIL)	    \
 	x(RCPT)	    \
-	x(DATA)
+	x(DATA)	    \
+	x(NOOP)
 
 #define _mk_proto(x) \
 static bool handle_ ## x (struct client *c, char *parameters);
@@ -509,6 +510,13 @@ handle_RCPT(struct client *c, char *parameters)
 	c->recipients[c->nr_recipients] = addr;
 	c->nr_recipients++;
 	queue_response(250, c, "receipt to %.128s", addr);
+	return true;
+}
+
+static bool
+handle_NOOP(struct client *c, char *parameters)
+{
+	queue_response(250, c, "NOOP");
 	return true;
 }
 
