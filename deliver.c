@@ -20,7 +20,7 @@
 #define LATENCY 10
 #define MAX_LINE_LENGTH 4096
 
-#define UPSTREAM_SERVER "smtp.hermes.cam.ac.uk:smtps"
+#define UPSTREAM_SERVER "smtp.hermes.cam.ac.uk"
 static const char *username;
 static const char *password;
 
@@ -255,9 +255,6 @@ forward(const char *name, const char *from, const struct string_set *to)
 		printf("%s%s", to->strings[i],
 		       i == to->n - 1 ? "\n" : ", ");
 
-	ERR_load_crypto_strings();
-	ERR_load_SSL_strings();
-	OpenSSL_add_all_algorithms();
 	ctx = SSL_CTX_new(SSLv23_client_method());
 
 	/* XXX check certificate */
@@ -270,6 +267,7 @@ forward(const char *name, const char *from, const struct string_set *to)
 		err(1, "Can't locate SSL pointer\n");
 	SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
 
+	BIO_set_conn_port(sbio, "smtps");
 	BIO_set_conn_hostname(sbio, UPSTREAM_SERVER);
 
 	if(BIO_do_connect(sbio) <= 0) {
@@ -423,6 +421,9 @@ main(int argc, char *argv[])
 	struct dirent *de;
 
 	SSL_library_init();
+	ERR_load_crypto_strings();
+	ERR_load_SSL_strings();
+	OpenSSL_add_all_algorithms();
 
 	username = base64_encode(getenv("SLOW_SMTP_USERNAME"));
 	password = base64_encode(getenv("SLOW_SMTP_PASSWORD"));
