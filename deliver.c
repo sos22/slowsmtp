@@ -16,11 +16,10 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
-#define SPOOL_DIR "spool/spool"
-#define LATENCY 10
+#include "config.h"
+
 #define MAX_LINE_LENGTH 4096
 
-#define UPSTREAM_SERVER "smtp.hermes.cam.ac.uk"
 static const char *username;
 static const char *password;
 
@@ -131,7 +130,7 @@ pump_data(const char *name, BIO *b)
 	   "\r\n", and 0 otherwise. */
 	int magic_offset;
 
-	asprintf(&path, "%s/%s/body", SPOOL_DIR, name);
+	asprintf(&path, "%s/spool/%s/body", SPOOL_DIR, name);
 	f = fopen(path, "r");
 	if (!f)
 		err(1, "opening %s", path);
@@ -302,7 +301,7 @@ consider_forwarding(const char *name)
 	char *from_address;
 	struct string_set to_addresses;
 
-	asprintf(&meta, "%s/%s/meta", SPOOL_DIR, name);
+	asprintf(&meta, "%s/spool/%s/meta", SPOOL_DIR, name);
 	meta_f = fopen(meta, "r");
 	if (!meta_f)
 		err(1, "fopen(%s)", meta);
@@ -419,6 +418,8 @@ main(int argc, char *argv[])
 {
 	DIR *d;
 	struct dirent *de;
+	long delay;
+	char *p;
 
 	SSL_library_init();
 	ERR_load_crypto_strings();
@@ -428,10 +429,13 @@ main(int argc, char *argv[])
 	username = base64_encode(getenv("SLOW_SMTP_USERNAME"));
 	password = base64_encode(getenv("SLOW_SMTP_PASSWORD"));
 
+	asprintf(&p, "%s/spool", SPOOL_DIR);
+
 	while (1) {
-		d = opendir(SPOOL_DIR);
+		delay = POLL_TIME;
+		d = opendir(p);
 		if (!d)
-			err(1, "opendir(%s)", SPOOL_DIR);
+			err(1, "opendir(%s)", p);
 		while (1) {
 			errno = 0;
 			de = readdir(d);
@@ -441,10 +445,13 @@ main(int argc, char *argv[])
 				break;
 			}
 			if (strcmp(de->d_name, ".") &&
-			    strcmp(de->d_name, ".."))
-				consider_forwarding(de->d_name);
+			    strcmp(de->d_name, "..")) {
+				long dl = consider_forwarding(de->d_name);
+				if (dl >= 0 && dl < delay)
+					delay = dl;
+			}
 		}
 		closedir(d);
-		sleep(1);
+		sleep(delay);
 	}
 }

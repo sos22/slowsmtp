@@ -15,6 +15,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "config.h"
+
 /* Try to avoid RX'ing less than this in one receive, to try to reduce
    the risk of silly window syndrome. */
 #define MIN_RX_SIZE 4096
@@ -29,8 +31,6 @@
 #define TX_BUF_INCREMENT 1024
 /* Maximum number of recipients per message */
 #define MAX_RECIPIENTS_PER_MESSAGE 512
-/* Where to stash received messages */
-#define SPOOL_DIR "spool"
 
 struct listen_socket {
 	int fd;
