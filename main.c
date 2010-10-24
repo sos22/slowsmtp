@@ -1,8 +1,10 @@
 #define _GNU_SOURCE
+#include <sys/fcntl.h>
 #include <assert.h>
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
+#include <ftw.h>
 #include <netdb.h>
 #include <poll.h>
 #include <stdarg.h>
@@ -10,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Try to avoid RX'ing less than this in one receive, to try to reduce
@@ -26,6 +29,8 @@
 #define TX_BUF_INCREMENT 1024
 /* Maximum number of recipients per message */
 #define MAX_RECIPIENTS_PER_MESSAGE 512
+/* Where to stash received messages */
+#define SPOOL_DIR "spool"
 
 struct listen_socket {
 	int fd;
@@ -61,6 +66,11 @@ struct client {
 	int nr_recips_allocated;
 	int nr_recipients;
 	char **recipients;
+
+	/* The data spool is allocated when we receive the DATA
+	 * command. */
+	FILE *data_spool;
+	char *data_spool_fname;
 };
 
 struct clientpool {
@@ -78,7 +88,13 @@ struct command_handler {
 	bool (*f)(struct client *c, char *parameters);
 };
 
-#define COMMANDS(x) x(HELO) x(QUIT) x(EHLO) x(MAIL) x(RCPT)
+#define COMMANDS(x) \
+	x(HELO)	    \
+	x(QUIT)	    \
+	x(EHLO)	    \
+	x(MAIL)	    \
+	x(RCPT)	    \
+	x(DATA)
 
 #define _mk_proto(x) \
 static bool handle_ ## x (struct client *c, char *parameters);
@@ -349,6 +365,40 @@ server_socket_did_something(struct listen_socket *l,
 }
 
 static bool
+alloc_spool_file(char **fname, FILE **f)
+{
+	int cntr;
+	char *path;
+	int fd;
+
+	*fname = NULL;
+	*f = NULL;
+
+	cntr = 0;
+	while (1) {
+		asprintf(&path, "%s/tmp/%d",
+			 SPOOL_DIR, cntr);
+		fd = open(path, O_WRONLY|O_CREAT|O_EXCL, 0600);
+		if (fd >= 0)
+			break;
+		if (errno != EEXIST) {
+			free(path);
+			return false;
+		}
+		cntr++;
+	}
+
+	*f = fdopen(fd, "w");
+	if (!*f) {
+		close(fd);
+		free(path);
+		return false;
+	}
+	*fname = path;
+	return true;
+}
+
+static bool
 handle_HELO(struct client *c, char *parameters)
 {
 	printf("Connection from %s.\n", parameters);
@@ -391,6 +441,15 @@ parse_bracketed_address(const char *input)
 	b = malloc(len - 1);
 	memcpy(b, input + 1, len - 2);
 	b[len-2] = 0;
+	/* We use line-delimited files later.  Make sure we don't
+	 * confuse ourselves. */
+	/* XXX I'm tempted to require that everything pass isprint()
+	   here, just for sanity, but it's not strictly needed and it
+	   might cause problems for UTF-8 email addresses etc. */
+	if (strchr(b, '\n')) {
+	    free(b);
+	    return NULL;
+	}
 	return b;
 }
 
@@ -453,11 +512,65 @@ handle_RCPT(struct client *c, char *parameters)
 	return true;
 }
 
+static bool
+handle_DATA(struct client *c, char *parameters)
+{
+	if (strcmp(parameters, "")) {
+		queue_response(501, c, "DATA takes no parameters");
+		return true;
+	}
+	if (!c->from_address || c->nr_recipients == 0) {
+		queue_response(503, c, "Need a sender and at least one recipient first");
+		return true;
+	}
+	if (c->data_spool_fname || c->data_spool) {
+		/* Not quite sure how this can happen... */
+		queue_response(503, c, "sequence error");
+		return true;
+	}
+
+	if (!alloc_spool_file(&c->data_spool_fname, &c->data_spool)) {
+		/* It's not immensely clear whether we should clear
+		   MAIL FROM: and RCPT TO: state at this point.  We
+		   choose not to, but it doesn't actually matter a
+		   great deal. */
+		free(c->data_spool_fname);
+		c->data_spool_fname = NULL;
+		queue_response(552, c, "failed to allocate spool area");
+		return true;
+	}
+
+	queue_response(354, c, "Go ahead");
+	return true;
+}
+
+/* Drop all of the per-message state, including on the filesystem. */
+static void
+flush_state(struct client *c)
+{
+	int i;
+
+	if (c->data_spool) {
+		fclose(c->data_spool);
+		c->data_spool = NULL;
+	}
+	if (c->data_spool_fname) {
+		unlink(c->data_spool_fname);
+		free(c->data_spool_fname);
+		c->data_spool_fname = NULL;
+	}
+	free(c->from_address);
+	c->from_address = NULL;
+	for (i = 0; i < c->nr_recipients; i++)
+		free(c->recipients[i]);
+	free(c->recipients);
+	c->recipients = NULL;
+	c->nr_recipients = 0;
+}
+
 static void
 client_error(struct client *c)
 {
-	int x;
-
 	/* The client has experience an error and needs to go away
 	 * now. */
 	close(c->fd);
@@ -470,10 +583,7 @@ client_error(struct client *c)
 	unsubscribe(c->clientpool->w, c->fd, POLLIN|POLLOUT);
 	free(c->rx_buf);
 	free(c->tx_buf);
-	free(c->from_address);
-	for (x = 0; x < c->nr_recipients; x++)
-		free(c->recipients[x]);
-	free(c->recipients);
+	flush_state(c);
 	free(c);
 }
 
@@ -506,11 +616,233 @@ process_command(struct client *c,
 	return true;
 }
 
+static bool
+allocate_delivery_slot(char **final_slot, char **temporary_slot)
+{
+	int cntr;
+	char *final_path;
+	char *temporary_path;
+	struct stat st;
+	int i;
+
+	/* Create a fresh directory which we're going to do delivery
+	   into, and also lock the final slot so that nobody else can
+	   create it.  The clever/hacky bit is that the temporary
+	   directory is the lock on the final one.  The simplest
+	   algorithm for doing so look slike this:
+
+	   while (1) {
+	      (temp, final) = invent_names();
+	      if (mkdir(temp) < 0 && errno == EEXIST)
+	          continue; // Try again
+	      if (stat(final) != ENOENT) {
+                  rmdir(temp);
+                  continue;
+              }
+              return;
+	   }
+
+	   The only way of creating the final is to create the
+	   temporary and rename it into place.  The only way of
+	   creating a temporary is via this function, and there's a
+	   one-to-one mapping between temps and finals.  You can't
+	   create a temporary once we've gotten past the mkdir(), and
+	   if we get past the stat then we know that no final exists
+	   and no temporary does either.
+
+	   (This assumes that rename is atomic, which it is on all
+	   sensible filesystems.)
+
+	   We optimise slightly by stat'ing the final before doing the
+	   mkdir, which avoids a bunch of redundant mkdir()s when
+	   there are already lots of queued messages, but that's a
+	   nice easy optimisation.
+	*/
+
+	cntr = 0;
+	final_path = temporary_path = NULL;
+	while (1) {
+		cntr++;
+		free(final_path);
+		free(temporary_path);
+		asprintf(&final_path, "%s/spool/%d",
+			 SPOOL_DIR, cntr);
+		asprintf(&temporary_path, "%s/incoming/%d",
+			 SPOOL_DIR, cntr);
+		i = stat(final_path, &st);
+		if (i >= 0)
+			continue;
+		if (errno != ENOENT)
+			goto failed;
+
+		i = mkdir(temporary_path, 0700);
+		if (i < 0) {
+			if (errno == EEXIST)
+				continue;
+			goto failed;
+		}
+
+		i = stat(final_path, &st);
+		if (i < 0 && errno == ENOENT) {
+			/* We're done */
+			*final_slot = final_path;
+			*temporary_slot = temporary_path;
+			return true;
+		}
+		rmdir(temporary_path);
+		if (i < 0)
+			goto failed;
+	}
+
+failed:
+	/* Some unexpected error in either stat() or mkdir() */
+	free(final_path);
+	free(temporary_path);
+	return false;
+}
+
+static int
+_recursive_remove_ftw(const char *fpath, const struct stat *st,
+		      int typeflag, struct FTW *ftw)
+{
+	printf("Kill %s\n", fpath);
+
+	/* Call me chicken... */
+#if 0
+	if (typeflag == FTW_F)
+		unlink(fpath);
+	else if (typeflag == FTW_D)
+		rmdir(fpath);
+#endif
+
+	return 0;
+}
+
+static void
+recursive_remove(const char *base)
+{
+	nftw(base, _recursive_remove_ftw, 50, FTW_DEPTH|FTW_PHYS);
+}
+
+
+static void
+finished_message(struct client *c)
+{
+	char *slot;
+	char *tslot;
+	char *path;
+	int i;
+	FILE *f;
+	bool success;
+
+	success = false;
+
+	path = slot = tslot = NULL;
+	f = NULL;
+
+	i = fclose(c->data_spool);
+	c->data_spool = NULL;
+	if (i == EOF) {
+		/* Well, that was a waste of effort */
+		goto err;
+	}
+
+	if (!allocate_delivery_slot(&slot, &tslot))
+		goto err;
+
+	asprintf(&path, "%s/body", tslot);
+	if (rename(c->data_spool_fname, path) < 0)
+		goto err;
+	free(path);
+	path = NULL;
+	free(c->data_spool_fname);
+	c->data_spool_fname = NULL;
+
+	asprintf(&path, "%s/meta", tslot);
+	f = fopen(path, "w");
+	free(path);
+	path = NULL;
+	if (!f)
+		goto err;
+	fprintf(f, "w: %ld\n", time(NULL));
+	fprintf(f, "f: %s\n", c->from_address);
+	for (i = 0; i < c->nr_recipients; i++)
+		fprintf(f, "t: %s\n", c->recipients[i]);
+	i = fclose(f);
+	f = NULL;
+	if (i == EOF)
+		goto err;
+
+	if (rename(tslot, slot) < 0)
+		goto err;
+
+	/* We're done */
+	success = true;
+
+err:
+	if (f)
+	    fclose(f);
+	if (tslot && !success)
+		recursive_remove(tslot);
+	free(tslot);
+	free(slot);
+	free(path);
+	flush_state(c);
+	if (success) {
+		/* This is aguably a bit of an abuse (should really
+		   sync() before sending this response), but it's good
+		   enough for the intended purposes. */
+		queue_response(250, c, "OK");
+	} else {
+		queue_response(552, c, "error in spooling");
+	}
+}
+
+static void
+receive_data(struct client *c)
+{
+	int idx;
+
+	for (idx = c->rx_buf_cons;
+	     idx < c->rx_buf_prod - 4;
+		) {
+		if (!memcmp(c->rx_buf + idx,
+			    "\r\n.\r\n",
+			    5)) {
+			/* We're done */
+			c->rx_buf_cons = idx + 5;
+			finished_message(c);
+			return;
+		}
+		if (!memcmp(c->rx_buf + idx,
+			    "\r\n.",
+			    3)) {
+			/* SMTP period escape */
+			fputc_unlocked('\r', c->data_spool);
+			fputc_unlocked('\n', c->data_spool);
+			idx += 3;
+		} else {
+			fputc_unlocked(c->rx_buf[idx], c->data_spool);
+			idx++;
+		}
+	}
+
+	/* Wait to receive more data */
+	c->rx_buf_cons = idx;
+	return;
+}
+
 static void
 run_rx_command_machine(struct client *c)
 {
 	int command_end;
 	int command_start;
+
+	/* DATA commands are special */
+	if (c->data_spool) {
+		receive_data(c);
+		return;
+	}
 
 	/* Parse up the next command.  Just goes to the end of a
 	 * line. */
@@ -534,8 +866,6 @@ static void
 client_can_read(struct client *c)
 {
 	ssize_t r;
-
-#warning Do something else for DATA command bodies
 
 	if (c->rx_buf_size - c->rx_buf_prod < MIN_RX_SIZE) {
 		memmove(c->rx_buf, c->rx_buf + c->rx_buf_cons,
