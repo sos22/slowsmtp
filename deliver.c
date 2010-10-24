@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <err.h>
 #include <errno.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,7 +21,6 @@
 #define MAX_LINE_LENGTH 4096
 
 #define UPSTREAM_SERVER "smtp.hermes.cam.ac.uk:smtps"
-
 static const char *username;
 static const char *password;
 
@@ -357,6 +357,65 @@ consider_forwarding(const char *name)
 	return -1;
 }
 
+static char
+base64_lookup(unsigned x)
+{
+	if (x <= 25)
+		return 'A' + x;
+	else if (x <= 51)
+		return 'a' + x - 26;
+	else if (x <= 61)
+		return '0' + x - 52;
+	else if (x == 62)
+		return '+';
+	else if (x == 63)
+		return '/';
+	else
+		abort();
+}
+
+static char *
+base64_encode(const char *src)
+{
+	int len = ((strlen(src) + 2) / 3) * 4;
+	char *output = calloc(len + 1, 1);
+	char *output_cursor = output;
+	unsigned char inp_buffer[3];
+	unsigned char out_buffer[4];
+	int x;
+	bool done = false;
+
+	while (!done) {
+		if (src[0] == 0)
+			break;
+		bzero(inp_buffer, sizeof(inp_buffer));
+		inp_buffer[0] = src[0];
+		inp_buffer[1] = src[1];
+		if (src[1] != 0)
+			inp_buffer[2] = src[2];
+		out_buffer[0] = inp_buffer[0] >> 2;
+		out_buffer[1] = (inp_buffer[0] << 4) | (inp_buffer[1] >> 4);
+		out_buffer[2] = (inp_buffer[1] << 2) | (inp_buffer[2] >> 6);
+		out_buffer[3] = inp_buffer[2];
+		for (x = 0; x < 4; x++)
+			out_buffer[x] = base64_lookup(out_buffer[x] % 64);
+
+		if (src[1] == 0) {
+			out_buffer[2] = '=';
+			out_buffer[3] = '=';
+			done = true;
+		} else if (src[2] == 0) {
+			out_buffer[3] = '=';
+			done = true;
+		}
+
+		memcpy(output_cursor, out_buffer, 4);
+		output_cursor += 4;
+		src += 3;
+	}
+	return output;
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -365,8 +424,8 @@ main(int argc, char *argv[])
 
 	SSL_library_init();
 
-	username = getenv("SLOW_SMTP_USERNAME");
-	password = getenv("SLOW_SMTP_PASSWORD");
+	username = base64_encode(getenv("SLOW_SMTP_USERNAME"));
+	password = base64_encode(getenv("SLOW_SMTP_PASSWORD"));
 
 	while (1) {
 		d = opendir(SPOOL_DIR);
